@@ -53,6 +53,11 @@ DEFAULT_CHANNELS: list[str] = [
 ]
 CHANNELS_PER_RUN_VIDEOS = 10  # how many recent uploads per channel to watch
 
+# Only notify Slack about videos published within this many days.
+# Older videos are silently added to seen.json + watchlist (so their
+# comments are still monitored) but won't flood the Slack channel.
+MAX_VIDEO_AGE_DAYS = 7
+
 SEEN_FILE = Path(__file__).parent / "seen.json"
 MAX_SEEN_PER_SOURCE = 2000  # cap state file size
 
@@ -90,6 +95,17 @@ def save_seen(seen: dict) -> None:
 
 def matches(text: str) -> bool:
     return bool(text and KEYWORD_RE.search(text))
+
+
+def is_recent(published_at: str, max_days: int = MAX_VIDEO_AGE_DAYS) -> bool:
+    """Check if a YouTube publishedAt timestamp is within max_days of now."""
+    try:
+        pub = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - pub
+        return age.days <= max_days
+    except (ValueError, TypeError):
+        # If we can't parse the date, treat it as recent (safer to notify)
+        return True
 
 
 # ---------- sources ----------
@@ -176,15 +192,12 @@ def check_youtube_videos(seen_videos: list) -> tuple[list[dict], list[str]]:
     matched_video_ids is fed into the comment watcher so we auto-watch
     comments on any video whose title/description matches.
 
-    Strategy for maximum coverage:
-    1. Run multiple search queries (different keywords) to cast a wider net
-    2. Search by both "date" and "relevance" order — relevance catches
-       description-only mentions that date ordering often misses
-    3. Use maxResults=50 (API max) for each query
-    4. Fetch FULL video metadata (videos.list) for every candidate, because
-       the search API truncates descriptions to ~160 chars — a description-
-       only mention like "Jetzt auf Debitum investieren" buried 500 chars
-       deep would be invisible in the truncated snippet
+    Uses multiple search queries and both date/relevance ordering for wide
+    coverage. Fetches full video metadata to check complete descriptions.
+
+    IMPORTANT: only videos published within MAX_VIDEO_AGE_DAYS generate Slack
+    notifications. Older videos are silently added to the watchlist (so their
+    comments are still monitored) but don't flood the channel.
     """
     if not YOUTUBE_API_KEY:
         return [], []
@@ -218,34 +231,42 @@ def check_youtube_videos(seen_videos: list) -> tuple[list[dict], list[str]]:
     if not candidate_ids:
         return [], []
 
-    # Step 2: fetch FULL metadata for all candidates (title + full description)
-    # videos.list supports up to 50 IDs per call and returns the COMPLETE
-    # description, unlike search.list which truncates it
+    # Step 2: fetch FULL metadata for all candidates
     hits: list[dict] = []
     matched_ids: list[str] = []
+    old_but_matched = 0
 
     for i in range(0, len(candidate_ids), 50):
         batch = list(candidate_ids)[i : i + 50]
         try:
-            data = yt_api("videos", {
+            vdata = yt_api("videos", {
                 "part": "snippet",
                 "id": ",".join(batch),
             })
         except Exception as e:
             print(f"[youtube videos detail] error: {e}", file=sys.stderr)
             continue
-        for item in data.get("items", []):
+        for item in vdata.get("items", []):
             vid = item.get("id")
             if not vid:
                 continue
             snippet = item.get("snippet", {})
             title = snippet.get("title", "")
             desc = snippet.get("description", "")
-            # Check the FULL title + description for keyword match
+            published = snippet.get("publishedAt", "")
             if not (matches(title) or matches(desc)):
                 continue
+            # Always add to watchlist (comments monitored forever)
             matched_ids.append(vid)
             if vid in seen_videos:
+                continue
+            # Only notify Slack for recent videos — old ones are silently
+            # added to seen.json so they won't re-trigger, and their comments
+            # are still watched via the watchlist
+            if not is_recent(published):
+                old_but_matched += 1
+                # Mark as seen so we don't re-check next run
+                seen_videos.append(vid)
                 continue
             hits.append({
                 "source": "YouTube video",
@@ -256,7 +277,8 @@ def check_youtube_videos(seen_videos: list) -> tuple[list[dict], list[str]]:
                 "seen_key": "youtube_video",
             })
 
-    print(f"  {len(matched_ids)} videos confirmed mentioning Debitum (full description check)")
+    print(f"  {len(matched_ids)} videos mention Debitum, "
+          f"{len(hits)} recent (notified), {old_but_matched} old (silenced)")
     return hits, matched_ids
 
 
@@ -332,7 +354,12 @@ def check_videos_metadata_for_mentions(
             snippet = item.get("snippet", {})
             title = snippet.get("title", "")
             desc = snippet.get("description", "")
+            published = snippet.get("publishedAt", "")
             if not (matches(title) or matches(desc)):
+                continue
+            # Only notify for recent videos; old ones silently marked as seen
+            if not is_recent(published):
+                seen_videos.append(vid)
                 continue
             hits.append({
                 "source": "YouTube video",
