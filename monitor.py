@@ -123,34 +123,38 @@ def check_reddit(seen: list) -> list[dict]:
 
 
 def check_google_alerts(seen: list) -> list[dict]:
+    """Supports multiple RSS feed URLs separated by commas in GOOGLE_ALERTS_RSS."""
     if not GOOGLE_ALERTS_RSS:
         return []
     hits = []
-    try:
-        feed = feedparser.parse(GOOGLE_ALERTS_RSS, agent=USER_AGENT)
-    except Exception as e:
-        print(f"[alerts] error: {e}", file=sys.stderr)
-        return hits
-    for entry in feed.entries:
-        entry_id = entry.get("id") or entry.get("link")
-        if not entry_id or entry_id in seen:
+    # Support comma-separated list of RSS URLs (e.g. general + YouTube-specific alert)
+    feed_urls = [u.strip() for u in GOOGLE_ALERTS_RSS.split(",") if u.strip()]
+    for feed_url in feed_urls:
+        try:
+            feed = feedparser.parse(feed_url, agent=USER_AGENT)
+        except Exception as e:
+            print(f"[alerts] error on {feed_url}: {e}", file=sys.stderr)
             continue
-        title = re.sub(r"<[^>]+>", " ", entry.get("title", ""))
-        summary = re.sub(r"<[^>]+>", " ", entry.get("summary", ""))
-        # Google Alerts URLs are wrapped — unwrap if possible
-        link = entry.get("link", "")
-        m = re.search(r"url=([^&]+)", link)
-        if m:
-            from urllib.parse import unquote
-            link = unquote(m.group(1))
-        hits.append({
-            "source": "Google Alerts",
-            "title": title,
-            "url": link,
-            "snippet": summary[:300],
-            "id": entry_id,
-            "seen_key": "alerts",
-        })
+        for entry in feed.entries:
+            entry_id = entry.get("id") or entry.get("link")
+            if not entry_id or entry_id in seen:
+                continue
+            title = re.sub(r"<[^>]+>", " ", entry.get("title", ""))
+            summary = re.sub(r"<[^>]+>", " ", entry.get("summary", ""))
+            # Google Alerts URLs are wrapped — unwrap if possible
+            link = entry.get("link", "")
+            m = re.search(r"url=([^&]+)", link)
+            if m:
+                from urllib.parse import unquote
+                link = unquote(m.group(1))
+            hits.append({
+                "source": "Google Alerts",
+                "title": title,
+                "url": link,
+                "snippet": summary[:300],
+                "id": entry_id,
+                "seen_key": "alerts",
+            })
     return hits
 
 
@@ -171,42 +175,88 @@ def check_youtube_videos(seen_videos: list) -> tuple[list[dict], list[str]]:
     Returns (hits, matched_video_ids).
     matched_video_ids is fed into the comment watcher so we auto-watch
     comments on any video whose title/description matches.
+
+    Strategy for maximum coverage:
+    1. Run multiple search queries (different keywords) to cast a wider net
+    2. Search by both "date" and "relevance" order — relevance catches
+       description-only mentions that date ordering often misses
+    3. Use maxResults=50 (API max) for each query
+    4. Fetch FULL video metadata (videos.list) for every candidate, because
+       the search API truncates descriptions to ~160 chars — a description-
+       only mention like "Jetzt auf Debitum investieren" buried 500 chars
+       deep would be invisible in the truncated snippet
     """
     if not YOUTUBE_API_KEY:
         return [], []
+
+    # Step 1: collect candidate video IDs from multiple search passes
+    candidate_ids: set[str] = set()
+    search_queries = ["debitum", "debitum investments", "debitum network"]
+    search_orders = ["date", "relevance"]
+
+    for query in search_queries:
+        for order in search_orders:
+            try:
+                data = yt_api("search", {
+                    "part": "snippet",
+                    "q": query,
+                    "type": "video",
+                    "order": order,
+                    "maxResults": 50,
+                })
+            except Exception as e:
+                print(f"[youtube search q={query} order={order}] error: {e}",
+                      file=sys.stderr)
+                continue
+            for item in data.get("items", []):
+                vid = item.get("id", {}).get("videoId")
+                if vid:
+                    candidate_ids.add(vid)
+
+    print(f"  YouTube search returned {len(candidate_ids)} unique candidate videos")
+
+    if not candidate_ids:
+        return [], []
+
+    # Step 2: fetch FULL metadata for all candidates (title + full description)
+    # videos.list supports up to 50 IDs per call and returns the COMPLETE
+    # description, unlike search.list which truncates it
     hits: list[dict] = []
     matched_ids: list[str] = []
-    try:
-        data = yt_api("search", {
-            "part": "snippet",
-            "q": "debitum",
-            "type": "video",
-            "order": "date",
-            "maxResults": 25,
-        })
-    except Exception as e:
-        print(f"[youtube videos] error: {e}", file=sys.stderr)
-        return hits, matched_ids
-    for item in data.get("items", []):
-        vid = item.get("id", {}).get("videoId")
-        if not vid:
+
+    for i in range(0, len(candidate_ids), 50):
+        batch = list(candidate_ids)[i : i + 50]
+        try:
+            data = yt_api("videos", {
+                "part": "snippet",
+                "id": ",".join(batch),
+            })
+        except Exception as e:
+            print(f"[youtube videos detail] error: {e}", file=sys.stderr)
             continue
-        snippet = item.get("snippet", {})
-        title = snippet.get("title", "")
-        desc = snippet.get("description", "")
-        if not (matches(title) or matches(desc)):
-            continue
-        matched_ids.append(vid)
-        if vid in seen_videos:
-            continue
-        hits.append({
-            "source": "YouTube video",
-            "title": title,
-            "url": f"https://www.youtube.com/watch?v={vid}",
-            "snippet": f"{snippet.get('channelTitle', '')} — {desc[:250]}",
-            "id": vid,
-            "seen_key": "youtube_video",
-        })
+        for item in data.get("items", []):
+            vid = item.get("id")
+            if not vid:
+                continue
+            snippet = item.get("snippet", {})
+            title = snippet.get("title", "")
+            desc = snippet.get("description", "")
+            # Check the FULL title + description for keyword match
+            if not (matches(title) or matches(desc)):
+                continue
+            matched_ids.append(vid)
+            if vid in seen_videos:
+                continue
+            hits.append({
+                "source": "YouTube video",
+                "title": title,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "snippet": f"{snippet.get('channelTitle', '')} — {desc[:250]}",
+                "id": vid,
+                "seen_key": "youtube_video",
+            })
+
+    print(f"  {len(matched_ids)} videos confirmed mentioning Debitum (full description check)")
     return hits, matched_ids
 
 

@@ -60,18 +60,28 @@ unit per channel) and adds them to the comment watchlist automatically.
 - APIs & Services → Credentials → Create Credentials → API key
 - Copy the key
 
-### 3. Create a Google Alert (optional but recommended)
+### 3. Create Google Alerts (optional but recommended)
+
+Create TWO alerts for maximum coverage:
+
+**Alert 1 — General web (news, blogs, forums):**
 - Go to <https://www.google.com/alerts>
 - Search: `"Debitum"`
-- Click "Show options":
-  - How often: **As-it-happens**
-  - Sources: Automatic
-  - Language: Any
-  - Region: Any
-  - How many: All results
-  - Deliver to: **RSS feed**
+- Click "Show options": How often → As-it-happens, Sources → Automatic,
+  Language → Any, Region → Any, How many → All results, Deliver to → **RSS feed**
 - Click Create Alert
-- On the alerts dashboard, click the RSS icon next to your alert and copy the URL
+
+**Alert 2 — YouTube-specific (catches description-only mentions Google indexes):**
+- Same page, create a new alert
+- Search: `"Debitum" site:youtube.com`
+- Same options as above, Deliver to → **RSS feed**
+- This catches YouTube videos where "Debitum" appears anywhere Google can
+  see (title, description, even auto-captions) — a safety net for videos
+  the YouTube API search misses
+
+On the alerts dashboard, click the RSS icon next to each alert and copy
+both URLs. Combine them into the `GOOGLE_ALERTS_RSS` secret separated by
+a comma: `https://google.com/alerts/feeds/xxx,https://google.com/alerts/feeds/yyy`
 
 ### 4. Push this folder to a new GitHub repo
 ```bash
